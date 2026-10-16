@@ -1,4 +1,5 @@
 import os
+import json
 import threading
 import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -13,246 +14,234 @@ from telegram.ext import (
     filters,
 )
 
-# تنظیمات لاگ
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# اطلاعات اصلی
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_CHAT_ID = 8707572497
 CHANNEL_ID = -1004416175631
 
-# مراحل ساخت نظرسنجی
 GET_QUESTION, GET_OPTIONS = range(2)
-poll_creation_data = {}
+new_poll_temp = {}
+DB_FILE = "polls_data.json"
 
-# ----------------- وب‌سرور سبک برای Render -----------------
-class SimpleHandler(BaseHTTPRequestHandler):
+def load_data():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_data(data):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+# ساخت کیبورد با درصد و تعداد آرا
+def build_poll_keyboard(poll_id, poll_info):
+    options = poll_info["options"]
+    votes = poll_info["votes"]
+    total_votes = len(votes)
+
+    keyboard = []
+    for idx, opt_text in enumerate(options):
+        opt_count = sum(1 for v in votes.values() if v == idx)
+        percent = int((opt_count / total_votes) * 100) if total_votes > 0 else 0
+        btn_label = f"[{percent}% - {opt_count} رأی] {opt_text}"
+        callback_data = f"vote_{poll_id}_{idx}"
+        keyboard.append([InlineKeyboardButton(btn_label, callback_data=callback_data)])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+# سرور وب برای پایداری در رندر
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"DentalBox Survey Bot is running perfectly!")
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
 
-def run_http_server():
+def run_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
-    logger.info(f"Server started on port {port}")
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
 
-# ----------------- دستور /start ادمین -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_CHAT_ID:
-        await update.message.reply_text("⛔ شما به پنل ادمین دنتال‌باکس دسترسی ندارید.")
+        await update.message.reply_text("⛔ دسترسی به این پنل فقط برای مدیر مجاز است.")
         return ConversationHandler.END
 
-    keyboard = [
-        [InlineKeyboardButton("➕ ایجاد و ارسال نظرسنجی به کانال", callback_data="btn_create_poll")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
     await update.message.reply_text(
         "👋 سلام مدیر محترم دنتال‌باکس!\n\n"
-        "به پنل هوشمند مدیریت نظرسنجی مطب‌ها خوش آمدید.\n"
-        "برای طراحی و ارسال نظرسنجی روی دکمه زیر کلیک کنید:",
-        reply_markup=reply_markup
+        "برای ساخت نظرسنجی جدید و اختصاصی، دستور زیر را ارسال کنید:\n"
+        "/newpoll"
     )
     return ConversationHandler.END
 
-# ----------------- شروع ساخت نظرسنجی -----------------
-async def start_create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    await query.message.reply_text(
+async def new_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_CHAT_ID:
+        return ConversationHandler.END
+
+    await update.message.reply_text(
         "📝 **مرحله ۱:** لطفاً متن سؤال نظرسنجی را ارسال کنید:\n\n"
-        "(مثال: همکاران گرامی، اولویت شما در خرید کدام برند فایل اندو است؟)\n\n"
-        "❌ برای لغو در هر مرحله /cancel را ارسال کنید."
+        "❌ برای لغو: /cancel"
     )
     return GET_QUESTION
 
-async def receive_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    poll_creation_data["question"] = update.message.text
-    
+async def get_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_poll_temp["question"] = update.message.text
     await update.message.reply_text(
-        "✅ سؤال ثبت شد.\n\n"
-        "🔘 **مرحله ۲:** حالا گزینه‌ها را بفرستید (با اینتر یا ویرگول جدا کنید):"
+        "🔘 **مرحله ۲:** حالا گزینه‌ها را بفرستید.\n\n"
+        "هر گزینه را در یک خط جداگانه قرار دهید:\n"
+        "مثال:\n"
+        "باندینگ آل‌باند بیسکو\n"
+        "باندینگ جی‌سی پرمیو\n"
+        "باندینگ سینگل باند تری‌ام"
     )
     return GET_OPTIONS
 
-async def receive_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw_text = update.message.text
-    
-    if "\n" in raw_text:
-        options = [opt.strip() for opt in raw_text.split("\n") if opt.strip()]
-    elif "،" in raw_text:
-        options = [opt.strip() for opt in raw_text.split("،") if opt.strip()]
-    elif "," in raw_text:
-        options = [opt.strip() for opt in raw_text.split(",") if opt.strip()]
-    else:
-        options = [raw_text.strip()]
+async def get_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    options = [opt.strip() for opt in text.split("\n") if opt.strip()]
 
     if len(options) < 2:
-        await update.message.reply_text("⚠️ نظرسنجی باید حداقل دارای ۲ گزینه باشد. لطفاً دوباره گزینه‌ها را ارسال کنید:")
+        await update.message.reply_text("⚠️ نظرسنجی حداقل باید ۲ گزینه داشته باشد. دوباره بفرستید:")
         return GET_OPTIONS
 
-    question = poll_creation_data.get("question", "نظرسنجی دنتال‌باکس")
-    
-    # ساخت دکمه‌های اولیه (بدون رای)
-    keyboard = []
-    for idx, opt in enumerate(options):
-        keyboard.append([InlineKeyboardButton(f"▫️ {opt} (0 رای - 0%)", callback_data=f"vote_{idx}")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    channel_post_text = (
-        f"📊 **نظرسنجی تأمین دنتال‌باکس**\n\n"
-        f"❓ **{question}**\n\n"
-        f"لطفاً با لمس گزینه موردنظر، در بهبود سبد توزیع مشارکت کنید 👇"
-    )
+    question = new_poll_temp.get("question", "نظرسنجی دنتال‌باکس")
+    data = load_data()
+    poll_id = str(len(data) + 1)
+
+    poll_info = {
+        "question": question,
+        "options": options,
+        "votes": {},       # user_id: option_index
+        "voters": {}       # user_id: voter_details
+    }
+
+    reply_markup = build_poll_keyboard(poll_id, poll_info)
+    msg_text = f"📊 **{question}**\n\nبرای ثبت رأی روی گزینه مورد نظر کلیک کنید:"
 
     try:
         sent_msg = await context.bot.send_message(
             chat_id=CHANNEL_ID,
-            text=channel_post_text,
+            text=msg_text,
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
-        
-        # ذخیره اطلاعات نظرسنجی و آرا در bot_data
-        context.bot_data[f"poll_{sent_msg.message_id}"] = {
-            "question": question,
-            "options": options,
-            "votes": {idx: 0 for idx in range(len(options))}, # تعداد رای هر گزینه
-            "user_votes": {} # ثبت اینکه چه کاربری به کدام گزینه رای داده (جلوگیری از رای تکراری)
-        }
+        poll_info["channel_message_id"] = sent_msg.message_id
+        data[poll_id] = poll_info
+        save_data(data)
 
-        await update.message.reply_text(
-            f"🎉 **نظرسنجی با موفقیت در کانال منتشر شد!**\n\n"
-            f"پیام شماره {sent_msg.message_id} به کانال خصوصی ارسال گردید."
-        )
+        await update.message.reply_text("🎉 **نظرسنجی با درصد و تعداد زنده به کانال ارسال شد!**")
     except Exception as e:
+        logger.error(f"Error: {e}")
         await update.message.reply_text(f"❌ خطا در ارسال به کانال:\n`{str(e)}`")
 
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("عملیات ساخت نظرسنجی لغو شد.")
-    return ConversationHandler.END
-
-# ----------------- هندلر ثبت رأی و آپدیت زنده دکمه‌ها -----------------
-async def handle_votes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    data = query.data
+    user = query.from_user
+    user_id = str(user.id)
+    data_str = query.data
 
-    if data.startswith("vote_"):
-        idx = int(data.split("_")[1])
-        user = query.from_user
-        msg_id = query.message.message_id
-        poll_key = f"poll_{msg_id}"
-        
-        poll_info = context.bot_data.get(poll_key)
-        if not poll_info:
-            await query.answer("⚠️ اطلاعات این نظرسنجی منقضی شده است.", show_alert=True)
-            return
-
-        user_votes = poll_info["user_votes"]
-        votes = poll_info["votes"]
-        options = poll_info["options"]
-
-        # بررسی رای قبلی کاربر (جلوگیری از تغییر یا ثبت چندباره یا ثبت به عنوان رای جدید)
-        user_id_str = str(user.id)
-        if user_id_str in user_votes:
-            old_idx = user_votes[user_id_str]
-            if old_idx == idx:
-                await query.answer("شما قبلاً به همین گزینه رای داده‌اید! 🙏", show_alert=True)
-                return
-            else:
-                # اگر نظرش را عوض کرد
-                votes[old_idx] = max(0, votes[old_idx] - 1)
-        
-        # ثبت یا به‌روزرسانی رای جدید
-        user_votes[user_id_str] = idx
-        votes[idx] += 1
-
-        # محاسبه مجموع آرا و درصدها
-        total_votes = sum(votes.values())
-
-        # ساخت مجدد دکمه‌ها با آمار جدید
-        keyboard = []
-        for i, opt in enumerate(options):
-            count = votes[i]
-            percent = int((count / total_votes) * 100) if total_votes > 0 else 0
-            
-            # اگر این گزینه رای کاربر فعلی است، علامت تیک بزنیم
-            prefix = "✅ " if user_votes.get(user_id_str) == i else "▫️ "
-            btn_text = f"{prefix}{opt} ({count} رای - {percent}%)"
-            
-            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"vote_{i}")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        # آپدیت پیام کانال با دکمه‌های جدید دارای آمار
-        try:
-            await query.edit_message_reply_markup(reply_markup=reply_markup)
-        except Exception as e:
-            logger.error(f"Error updating inline keyboard: {e}")
-
-        # پیام تایید برای کاربر
-        await query.answer("✅ رای شما با موفقیت ثبت شد و آمار کانال به‌روز گردید! 📊", show_alert=True)
-
-        # ارسال گزارش فوری به پیوی ادمین
-        user_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
-        username_str = f"@{user.username}" if user.username else "ندارد"
-        option_title = options[idx]
-        
-        admin_alert = (
-            f"🔔 **ثبت رأی جدید در کانال دنتال‌باکس!**\n\n"
-            f"👤 **همکار:** {user_name} ({username_str})\n"
-            f"🆔 **آیدی:** `{user.id}`\n\n"
-            f"❓ **سؤال:** {poll_info['question']}\n"
-            f"🎯 **انتخاب:** {option_title}\n"
-            f"📈 **مجموع کل آرای این نظرسنجی:** {total_votes} رای"
-        )
-        
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=admin_alert,
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Error alerting admin: {e}")
-
-# ----------------- اجرای اصلی -----------------
-def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is not set!")
+    if not data_str.startswith("vote_"):
         return
 
-    server_thread = threading.Thread(target=run_http_server, daemon=True)
-    server_thread.start()
+    _, poll_id, opt_idx = data_str.split("_")
+    opt_idx = int(opt_idx)
+
+    polls = load_data()
+    if poll_id not in polls:
+        await query.answer("این نظرسنجی دیگر معتبر نیست.", show_alert=True)
+        return
+
+    poll = polls[poll_id]
+
+    # اگر قبلاً رأی داده باشد
+    if user_id in poll["votes"]:
+        await query.answer("شما قبلاً رأی خود را در این نظرسنجی ثبت کرده‌اید!", show_alert=True)
+        return
+
+    # ثبت رأی
+    selected_option = poll["options"][opt_idx]
+    poll["votes"][user_id] = opt_idx
+    voter_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+    poll["voters"][user_id] = {
+        "name": voter_name,
+        "username": f"@{user.username}" if user.username else "ندارد",
+        "choice": selected_option
+    }
+    save_data(polls)
+
+    await query.answer(f"✅ رأی شما به «{selected_option}» با موفقیت ثبت شد.")
+
+    # ۱. به‌روزرسانی درصدهای نمایش‌داده‌شده برای همه در کانال
+    new_markup = build_poll_keyboard(poll_id, poll)
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=CHANNEL_ID,
+            message_id=poll["channel_message_id"],
+            reply_markup=new_markup
+        )
+    except Exception as e:
+        logger.error(f"Could not update markup: {e}")
+
+    # ۲. ارسال فوری گزارش رأی به پی‌وی ادمین
+    admin_alert = (
+        "🔔 **یک رأی جدید در نظرسنجی ثبت شد!**\n\n"
+        f"📋 **سؤال:** {poll['question']}\n"
+        f"👤 **رأی‌دهنده:** {voter_name}\n"
+        f"🆔 **یوزرنیم:** {poll['voters'][user_id]['username']}\n"
+        f"🔹 **گزینه انتخابی:** {selected_option}\n"
+        f"📊 **مجموع آرا تا این لحظه:** {len(poll['votes'])} رأی"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=admin_alert,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Could not alert admin: {e}")
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("عملیات لغو شد.")
+    return ConversationHandler.END
+
+def main():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN is not set.")
+        return
+
+    t = threading.Thread(target=run_server, daemon=True)
+    t.start()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_create_poll, pattern="^btn_create_poll$")],
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("newpoll", new_poll)],
         states={
-            GET_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_question)],
-            GET_OPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_options)],
+            GET_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_question)],
+            GET_OPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_options)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(handle_votes, pattern="^vote_"))
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(handle_vote))
 
-    logger.info("Bot polling is running...")
-    app.run_polling()
+    logger.info("Bot starting with realtime percentage updates...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()

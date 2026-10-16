@@ -8,7 +8,7 @@ import uvicorn
 import threading
 
 TOKEN = "TOKEN_BOT_KHOD_RO_INJA_VARD_KONI"
-ADMIN_CHAT_ID = YOUR_ADMIN_CHAT_ID_NUMERIC
+ADMIN_CHAT_ID = 8707572497
 
 app_fastapi = FastAPI()
 
